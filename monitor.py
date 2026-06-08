@@ -6,6 +6,7 @@ No browser required — uses RSS feeds and public APIs.
 Dependencies: pip install requests deep-translator
 """
 
+import html as html_mod
 import json
 import os
 import re
@@ -31,13 +32,18 @@ X_ACCOUNTS = ["aleabitoreddit", "elonmusk"]
 
 TRUTH_SOCIAL_ACCOUNT_ID = "107780257626128497"  # @realDonaldTrump
 
-# RSSHub / Nitter instances to try for X (tried in order, first success wins)
-X_RSS_SOURCES = [
-    "https://rsshub.app/twitter/user/{username}",
-    "https://nitter.net/{username}/rss",
-    "https://nitter.privacydev.net/{username}/rss",
-    "https://nitter.poast.org/{username}/rss",
+# Nitter instances — used for both RSS discovery and full-text fetching
+NITTER_BASES = [
+    "https://nitter.net",
+    "https://nitter.privacydev.net",
+    "https://nitter.poast.org",
 ]
+
+# RSSHub as primary; Nitter RSS as fallbacks
+X_RSS_SOURCES = (
+    ["https://rsshub.app/twitter/user/{username}"]
+    + [b + "/{username}/rss" for b in NITTER_BASES]
+)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SocialMonitor/1.0)"}
 
@@ -48,15 +54,21 @@ def clean_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
+def extract_div_content(html: str, class_fragment: str) -> str:
+    """Extract text content of the first <div> whose class contains class_fragment."""
+    pattern = rf'class="[^"]*{re.escape(class_fragment)}[^"]*"[^>]*>([\s\S]*?)</div>'
+    m = re.search(pattern, html)
+    return html_mod.unescape(clean_html(m.group(1))).strip() if m else ""
+
+
 def format_time(dt: datetime) -> str:
-    """Return a formatted time string with both local and Beijing time."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     beijing_dt = dt.astimezone(BEIJING)
     local_str = dt.strftime("%Y-%m-%d %H:%M %Z")
     beijing_str = beijing_dt.strftime("%Y-%m-%d %H:%M 北京时间")
     if dt.utcoffset() == timedelta(hours=8):
-        return beijing_str  # already Beijing, no need to show twice
+        return beijing_str
     return f"{local_str}  /  {beijing_str}"
 
 
@@ -68,16 +80,51 @@ def load_seen() -> set:
 
 
 def save_seen(seen: set) -> None:
-    # Keep only the most recent 500 IDs to avoid unbounded growth
     with open(SEEN_FILE, "w") as f:
         json.dump(sorted(seen)[-500:], f, indent=2)
+
+
+# ── Full-text fetcher (Nitter status page) ────────────────────────────────────
+
+
+def fetch_nitter_fulltext(username: str, post_id: str) -> dict:
+    """
+    Fetch full tweet text + quoted tweet from a Nitter status page.
+    Returns {"text": str, "quote": str}; empty strings on failure.
+    """
+    for base in NITTER_BASES:
+        try:
+            url = f"{base}/{username}/status/{post_id}"
+            r = requests.get(url, timeout=12, headers=HEADERS)
+            if r.status_code != 200:
+                continue
+
+            page = r.text
+
+            # Split at the quote block so we can parse main vs quoted separately
+            quote_text = ""
+            parts = re.split(r'<div class="quote', page, maxsplit=1)
+            main_section = parts[0]
+            if len(parts) > 1:
+                quote_section = parts[1]
+                quote_text = extract_div_content(quote_section, "tweet-content")
+
+            main_text = extract_div_content(main_section, "tweet-content")
+
+            if main_text:
+                print(f"  Full text fetched from {base}")
+                return {"text": main_text, "quote": quote_text}
+        except Exception as e:
+            print(f"  Nitter fulltext failed ({base}): {e}")
+
+    return {"text": "", "quote": ""}
 
 
 # ── Fetchers ──────────────────────────────────────────────────────────────────
 
 
 def fetch_x_posts(username: str) -> list[dict]:
-    """Fetch latest posts for an X account via RSS (RSSHub or Nitter)."""
+    """Discover new posts via RSS, then fetch full text from Nitter status page."""
     for url_tmpl in X_RSS_SOURCES:
         url = url_tmpl.format(username=username)
         try:
@@ -88,32 +135,51 @@ def fetch_x_posts(username: str) -> list[dict]:
             posts = []
             for item in root.findall(".//item")[:5]:
                 link = item.findtext("link", "")
-                # Only keep original posts (skip retweets / likes from others)
+                # Only original posts from this user
                 if f"/{username}/status/" not in link.lower():
                     continue
+                post_id = link.split("/status/")[-1].split("?")[0]
+
+                # Fallback text from RSS in case full-text fetch fails
                 desc = item.findtext("description", "")
                 title = item.findtext("title", "")
-                text = clean_html(desc or title)[:500]
-                post_id = link.split("/status/")[-1].split("?")[0]
+                rss_text = html_mod.unescape(clean_html(desc if desc.strip() else title))
+
                 pub_date = item.findtext("pubDate", "")
                 try:
                     dt = parsedate_to_datetime(pub_date) if pub_date else None
                     time_str = format_time(dt) if dt else ""
                 except Exception:
                     time_str = ""
-                if text and len(text) > 5:
-                    posts.append(
-                        {"id": post_id, "text": text, "link": link,
-                         "username": username, "source": "X", "time_str": time_str}
-                    )
+
+                if rss_text and len(rss_text) > 5:
+                    posts.append({
+                        "id": post_id,
+                        "text": rss_text,   # will be enriched below
+                        "quote": "",
+                        "link": link,
+                        "username": username,
+                        "source": "X",
+                        "time_str": time_str,
+                    })
+
             if posts:
-                print(f"  [@{username}] Got {len(posts)} posts via {url}")
+                print(f"  [@{username}] Discovered {len(posts)} posts via {url}")
                 return posts
         except Exception as e:
-            print(f"  [@{username}] Source {url} failed: {e}")
+            print(f"  [@{username}] RSS source {url} failed: {e}")
 
     print(f"  [@{username}] All RSS sources failed")
     return []
+
+
+def enrich_x_post(post: dict) -> dict:
+    """Replace truncated RSS text with full text + quoted content from Nitter."""
+    result = fetch_nitter_fulltext(post["username"], post["id"])
+    if result["text"]:
+        post["text"] = result["text"]
+        post["quote"] = result["quote"]
+    return post
 
 
 def fetch_truth_social_posts() -> list[dict]:
@@ -124,21 +190,30 @@ def fetch_truth_social_posts() -> list[dict]:
         r.raise_for_status()
         posts = []
         for s in r.json()[:5]:
-            text = clean_html(s.get("content", ""))
-            # Skip empty posts and bare retweets
+            text = html_mod.unescape(clean_html(s.get("content", "")))
             if not text or len(text) < 5 or text.startswith("RT @"):
                 continue
+
+            # Quoted / reblogged post
+            quote = ""
+            if s.get("reblog"):
+                quote = html_mod.unescape(clean_html(s["reblog"].get("content", "")))
+
             try:
                 dt = datetime.fromisoformat(s["created_at"].replace("Z", "+00:00"))
                 time_str = format_time(dt)
             except Exception:
                 time_str = ""
-            posts.append(
-                {"id": s["id"], "text": text[:500],
-                 "link": s.get("url", ""),
-                 "username": "realDonaldTrump", "source": "TruthSocial",
-                 "time_str": time_str}
-            )
+
+            posts.append({
+                "id": s["id"],
+                "text": text[:3000],
+                "quote": quote[:1000],
+                "link": s.get("url", ""),
+                "username": "realDonaldTrump",
+                "source": "TruthSocial",
+                "time_str": time_str,
+            })
         print(f"  [@realDonaldTrump] Got {len(posts)} posts via API")
         return posts
     except Exception as e:
@@ -150,10 +225,8 @@ def fetch_truth_social_posts() -> list[dict]:
 
 
 def translate_to_chinese(text: str) -> str:
-    """Translate text to Chinese using Google Translate (no API key required)."""
     try:
         from deep_translator import GoogleTranslator
-        # Google Translate has a ~5000 char limit per request
         return GoogleTranslator(source="auto", target="zh-CN").translate(text[:4500])
     except Exception as e:
         print(f"  Translation failed: {e}")
@@ -166,10 +239,14 @@ def translate_to_chinese(text: str) -> str:
 def push_to_feishu(post: dict, translation: str) -> bool:
     source_label = "X" if post["source"] == "X" else "Truth Social"
     title = f"【{source_label} · @{post['username']}】新动态"
-    time_line = f"🕐 发帖时间：{post['time_str']}\n\n" if post.get("time_str") else ""
+
+    time_line = f"🕐 {post['time_str']}\n\n" if post.get("time_str") else ""
+    quote_block = f"\n\n💬 引用内容\n\n{post['quote']}" if post.get("quote") else ""
+
     body = (
         f"{time_line}"
         f"📄 原文\n\n{post['text']}"
+        f"{quote_block}"
         f"\n\n---\n\n"
         f"🇨🇳 中文译文\n\n{translation}"
     )
@@ -223,12 +300,22 @@ def main():
     for post in new_posts:
         preview = post["text"][:60].replace("\n", " ")
         print(f"Processing: @{post['username']} — {preview}...")
-        translation = translate_to_chinese(post["text"])
+
+        # Fetch full text + quoted content for X posts
+        if post["source"] == "X":
+            post = enrich_x_post(post)
+
+        # Translate: main text + quoted content if present
+        text_to_translate = post["text"]
+        if post.get("quote"):
+            text_to_translate += "\n\n[引用] " + post["quote"]
+        translation = translate_to_chinese(text_to_translate)
+
         success = push_to_feishu(post, translation)
         if success:
             seen.add(post["id"])
             pushed += 1
-        time.sleep(2)  # rate-limit between pushes
+        time.sleep(2)
 
     save_seen(seen)
     print(f"\nDone. Pushed {pushed} new post(s).")
