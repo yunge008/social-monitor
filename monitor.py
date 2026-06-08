@@ -11,8 +11,12 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 
 import requests
+
+BEIJING = timezone(timedelta(hours=8))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -42,6 +46,18 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SocialMonitor/1.0)"}
 
 def clean_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
+def format_time(dt: datetime) -> str:
+    """Return a formatted time string with both local and Beijing time."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    beijing_dt = dt.astimezone(BEIJING)
+    local_str = dt.strftime("%Y-%m-%d %H:%M %Z")
+    beijing_str = beijing_dt.strftime("%Y-%m-%d %H:%M 北京时间")
+    if dt.utcoffset() == timedelta(hours=8):
+        return beijing_str  # already Beijing, no need to show twice
+    return f"{local_str}  /  {beijing_str}"
 
 
 def load_seen() -> set:
@@ -79,10 +95,16 @@ def fetch_x_posts(username: str) -> list[dict]:
                 title = item.findtext("title", "")
                 text = clean_html(desc or title)[:500]
                 post_id = link.split("/status/")[-1].split("?")[0]
+                pub_date = item.findtext("pubDate", "")
+                try:
+                    dt = parsedate_to_datetime(pub_date) if pub_date else None
+                    time_str = format_time(dt) if dt else ""
+                except Exception:
+                    time_str = ""
                 if text and len(text) > 5:
                     posts.append(
                         {"id": post_id, "text": text, "link": link,
-                         "username": username, "source": "X"}
+                         "username": username, "source": "X", "time_str": time_str}
                     )
             if posts:
                 print(f"  [@{username}] Got {len(posts)} posts via {url}")
@@ -106,10 +128,16 @@ def fetch_truth_social_posts() -> list[dict]:
             # Skip empty posts and bare retweets
             if not text or len(text) < 5 or text.startswith("RT @"):
                 continue
+            try:
+                dt = datetime.fromisoformat(s["created_at"].replace("Z", "+00:00"))
+                time_str = format_time(dt)
+            except Exception:
+                time_str = ""
             posts.append(
                 {"id": s["id"], "text": text[:500],
                  "link": s.get("url", ""),
-                 "username": "realDonaldTrump", "source": "TruthSocial"}
+                 "username": "realDonaldTrump", "source": "TruthSocial",
+                 "time_str": time_str}
             )
         print(f"  [@realDonaldTrump] Got {len(posts)} posts via API")
         return posts
@@ -138,7 +166,9 @@ def translate_to_chinese(text: str) -> str:
 def push_to_feishu(post: dict, translation: str) -> bool:
     source_label = "X" if post["source"] == "X" else "Truth Social"
     title = f"【{source_label} · @{post['username']}】新动态"
+    time_line = f"🕐 发帖时间：{post['time_str']}\n\n" if post.get("time_str") else ""
     body = (
+        f"{time_line}"
         f"📄 原文\n\n{post['text']}"
         f"\n\n---\n\n"
         f"🇨🇳 中文译文\n\n{translation}"
